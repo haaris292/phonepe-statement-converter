@@ -146,3 +146,14 @@ if uploaded:
                 except: pass
         except Exception as e:
             st.error("Error: " + str(e))
+
+st.markdown(
+    """
+    <hr style="margin-top:40px;">
+    <div style="text-align:center; font-size:14px;">
+        Made with ❤️ by <a href="https://thecompusoft.com" target="_blank">thecompusoft.com</a>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
