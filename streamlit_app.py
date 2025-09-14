@@ -8,28 +8,14 @@ from pathlib import Path
 from PyPDF2 import PdfReader, PdfWriter
 import pdfplumber
 import re
+import os
 
 DATE_LINE_RE = re.compile(
     r'^[A-Za-z]{3}\s+\d{1,2},\s*\d{4}\s+.*(Debit|Credit)\s+INR\s+([\d,]+\.\d{2}|\d+)', re.IGNORECASE)
 TIME_TID_RE = re.compile(r'^(\d{1,2}:\d{2}\s*(?:AM|PM))\s+Transaction ID\s*:\s*(\S+)', re.IGNORECASE)
 UTR_RE = re.compile(r'^UTR No\s*:\s*(\S+)', re.IGNORECASE)
 
-def unlock_pdf(in_memory_bytes, password):
-    reader = PdfReader(in_memory_bytes)
-    if not reader.is_encrypted:
-        return in_memory_bytes
-    if not password:
-        raise ValueError("Password required")
-    if reader.decrypt(password) == 0:
-        raise ValueError("Incorrect password")
-    writer = PdfWriter()
-    for p in reader.pages:
-        writer.add_page(p)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    with open(tmp.name, "wb") as f:
-        writer.write(f)
-    return tmp.name
-
+# --- PDF helpers ---
 def extract_lines(path_or_bytes):
     lines = []
     with pdfplumber.open(path_or_bytes) as pdf:
@@ -86,74 +72,74 @@ def parse_transactions(lines):
             i += 1
     return pd.DataFrame(records)
 
-st.title("PhonePe PDF → CSV / Excel")
-uploaded = st.file_uploader("Upload PhonePe PDF", type="pdf")
-password = st.text_input("Password (if encrypted)", type="password")
-fmt = st.radio("Output format", ["csv","excel"])
-if uploaded:
-    if st.button("Convert"):
-        try:
-            tmp_path = None
-            # try to open in-memory. If encrypted, use unlock
-            try:
-                reader = PdfReader(uploaded)
-                if reader.is_encrypted:
-                    if not password:
-                        st.error("PDF is encrypted — please provide password")
-                        st.stop()
-                    if reader.decrypt(password) == 0:
-                        st.error("Incorrect password")
-                        st.stop()
-                    # write unlocked temp
-                    writer = PdfWriter()
-                    for p in reader.pages:
-                        writer.add_page(p)
-                    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                    with open(tmpf.name, "wb") as f:
-                        writer.write(f)
-                    tmp_path = tmpf.name
-                    source = tmp_path
-                else:
-                    # write uploaded bytes to temp file for pdfplumber
-                    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                    tmpf.write(uploaded.getbuffer())
-                    tmpf.close()
-                    tmp_path = tmpf.name
-                    source = tmp_path
-            except Exception as e:
-                st.error("Failed to open PDF: " + str(e))
-                st.stop()
+# --- Streamlit UI ---
+st.set_page_config(page_title="PhonePe PDF → CSV/Excel", page_icon="💳", layout="centered")
 
+st.title("💳 PhonePe PDF → CSV / Excel Converter")
+
+# How to use instructions
+st.markdown("""
+### ℹ️ How to use this tool
+1. **Upload your PhonePe PDF statement** using the uploader below.  
+2. If the PDF is **password-protected**, enter the password in the text box.  
+3. Choose your preferred output format (**CSV** or **Excel**).  
+4. Click **Convert**.  
+5. Preview the first few rows of data, then download the full file.  
+
+👉 *Note: Your data is processed locally in memory and not stored.*
+""")
+
+uploaded = st.file_uploader("📂 Upload PhonePe PDF", type="pdf")
+password = st.text_input("🔑 Password (leave empty if not encrypted)", type="password")
+fmt = st.radio("📄 Output format", ["csv","excel"])
+
+if uploaded:
+    if st.button("🚀 Convert"):
+        try:
+            # write uploaded file to a temp path
+            tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            tmpf.write(uploaded.getbuffer())
+            tmpf.close()
+            source = tmpf.name
+
+            # try reading
+            reader = PdfReader(source)
+            if reader.is_encrypted:
+                if not password:
+                    st.error("PDF is encrypted — please provide a password.")
+                    st.stop()
+                if reader.decrypt(password) == 0:
+                    st.error("Incorrect password.")
+                    st.stop()
+                # decrypt to temp
+                writer = PdfWriter()
+                for p in reader.pages:
+                    writer.add_page(p)
+                tmp2 = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+                with open(tmp2.name, "wb") as f:
+                    writer.write(f)
+                source = tmp2.name
+
+            # extract + parse
             lines = extract_lines(source)
             df = parse_transactions(lines)
             if df.empty:
-                st.warning("No transactions parsed — PDF structure may differ.")
+                st.warning("⚠️ No transactions parsed — check that the PDF format is supported.")
             else:
-                st.write("Preview:")
-                st.dataframe(df.head(10))
+                st.success(f"✅ Parsed {len(df)} transactions.")
+                st.dataframe(df.head(10))  # preview
                 if fmt == "csv":
-                    st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"),
+                    st.download_button("⬇️ Download CSV", data=df.to_csv(index=False).encode("utf-8"),
                                        file_name="phonepe_transactions.csv", mime="text/csv")
                 else:
-                    # write to bytes
                     tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
                     df.to_excel(tmp_out.name, index=False)
                     with open(tmp_out.name, "rb") as f:
-                        st.download_button("Download Excel", data=f.read(), file_name="phonepe_transactions.xlsx")
+                        st.download_button("⬇️ Download Excel", data=f.read(),
+                                           file_name="phonepe_transactions.xlsx",
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                     os.remove(tmp_out.name)
-            if tmp_path:
-                try: os.remove(tmp_path)
-                except: pass
+
+            os.remove(source)
         except Exception as e:
-            st.error("Error: " + str(e))
-
-st.markdown(
-    """
-    <hr style="margin-top:40px;">
-    <div style="text-align:center; font-size:14px;">
-        Made with ❤️ by <a href="https://thecompusoft.com" target="_blank">thecompusoft.com</a>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
+            st.error("❌ Error: " + str(e))
