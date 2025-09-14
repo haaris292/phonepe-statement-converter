@@ -24,5 +24,9 @@ This tool:
 
 ### 1. Clone this repo
 ```bash
-git clone https://github.com/<your-username>/phonepe-statement-converter.git
+git clone https://github.com/haaris292/phonepe-statement-converter.git
 cd phonepe-statement-converter
+
+
+You can also view this app on below url:
+https://phonepe-statement-converter-oc5znbg39ladk3pjk6qy7p.streamlit.app/
