@@ -1,5 +1,4 @@
 # streamlit_app.py
-# Requirements:
 # pip install streamlit pdfplumber pandas openpyxl PyPDF2
 
 import streamlit as st
@@ -11,94 +10,59 @@ import re
 import os
 import unicodedata
 
-# -------------------------------------------------
-# Regex patterns (universal PhonePe support)
-# -------------------------------------------------
+# -----------------------------
+# Regex patterns
+# -----------------------------
 DATE_RE = re.compile(r'[A-Za-z]{3}\s+\d{1,2},\s*\d{4}')
 TIME_RE = re.compile(r'\d{1,2}[:￾]\d{2}\s*(am|pm)', re.IGNORECASE)
 AMOUNT_RE = re.compile(r'(DEBIT|CREDIT)\s*[₹]?\s*([\d,]+)', re.IGNORECASE)
 TID_RE = re.compile(r'Transaction ID\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
-UTR_RE = re.compile(r'UTR\s*No\.?\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
 DETAILS_RE = re.compile(
     r'(Paid to|Received from)\s+(.+?)\s+(DEBIT|CREDIT)',
     re.IGNORECASE | re.DOTALL
 )
 
-# -------------------------------------------------
-# Text sanitization for Excel
-# -------------------------------------------------
-def sanitize_for_excel(value):
-    """
-    Remove characters that Excel does not allow.
-    """
-    if not isinstance(value, str):
-        return value
+# -----------------------------
+# Category rules
+# -----------------------------
+CATEGORY_RULES = {
+    "Groceries": ["dudh", "milk", "kirana", "store", "mart", "general"],
+    "Medical": ["medical", "pharma", "hospital", "clinic", "eye", "lab"],
+    "Food & Dining": ["hotel", "restaurant", "dosa", "biryani", "bakery"],
+    "Fuel": ["petroleum", "fuel", "hp", "io", "bp"],
+    "Shopping": ["collection", "fashion", "dress"],
+    "Utilities": ["electric", "water", "gas"],
+}
 
-    # Normalize unicode
-    value = unicodedata.normalize("NFKD", value)
-
-    # Remove control characters (ASCII <32 except \n, \t)
-    value = "".join(
-        ch for ch in value
-        if ch == "\n" or ch == "\t" or ord(ch) >= 32
-    )
-
-    # Explicitly remove problematic PDF artifacts
-    value = value.replace("￾", "").replace("\uFFFE", "").replace("\uFFFF", "")
-
-    return value.strip()
+# -----------------------------
+# Helpers
+# -----------------------------
+def sanitize_for_excel(val):
+    if not isinstance(val, str):
+        return val
+    val = unicodedata.normalize("NFKD", val)
+    val = "".join(ch for ch in val if ord(ch) >= 32)
+    return val.strip()
 
 
-# -------------------------------------------------
-# PDF helpers
-# -------------------------------------------------
-def try_extract_text(pdf_path):
-    try:
-        text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text(x_tolerance=2, y_tolerance=2)
-                if t:
-                    t = t.replace("￾", ":")
-                    text += "\n" + t
-        return text if text.strip() else None
-    except Exception:
-        return None
+def categorize(details):
+    text = details.lower()
+    for cat, keywords in CATEGORY_RULES.items():
+        if any(k in text for k in keywords):
+            return cat
+    return "Others"
 
 
-def unlock_pdf_if_needed(pdf_path, password):
-    text = try_extract_text(pdf_path)
-    if text:
-        return pdf_path, text
-
-    reader = PdfReader(pdf_path)
-    if not reader.is_encrypted:
-        raise ValueError("PDF text could not be read.")
-
-    if not password:
-        raise ValueError("PDF appears restricted. Please provide password.")
-
-    if reader.decrypt(password) == 0:
-        raise ValueError("Incorrect PDF password.")
-
-    writer = PdfWriter()
-    for p in reader.pages:
-        writer.add_page(p)
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    with open(tmp.name, "wb") as f:
-        writer.write(f)
-
-    text = try_extract_text(tmp.name)
-    if not text:
-        raise ValueError("Unable to extract text even after decryption.")
-
-    return tmp.name, text
+def extract_text(pdf_path):
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text(x_tolerance=2, y_tolerance=2)
+            if t:
+                text += "\n" + t.replace("￾", ":")
+    return text
 
 
-# -------------------------------------------------
-# Universal transaction parser
-# -------------------------------------------------
 def parse_transactions(text):
     records = []
     chunks = re.split(r'UTR\s*No\.?\s*(?:\:)?\s*', text, flags=re.IGNORECASE)
@@ -107,12 +71,9 @@ def parse_transactions(text):
         try:
             utr = re.match(r'(\S+)', chunk).group(1)
 
-            tid = TID_RE.search(chunk)
-            tid = tid.group(1) if tid else ""
-
             amt = AMOUNT_RE.search(chunk)
             txn_type = amt.group(1).title() if amt else ""
-            amount = amt.group(2).replace(",", "") if amt else ""
+            amount = float(amt.group(2).replace(",", "")) if amt else 0.0
 
             date = DATE_RE.search(chunk)
             date = date.group(0) if date else ""
@@ -126,10 +87,9 @@ def parse_transactions(text):
             records.append({
                 "Date & Time": f"{date} {time}".strip(),
                 "Transaction Details": details,
-                "Transaction ID": tid,
-                "UTR No": utr,
                 "Type": txn_type,
-                "Amount": amount
+                "Amount": amount,
+                "Category": categorize(details)
             })
         except Exception:
             continue
@@ -137,66 +97,97 @@ def parse_transactions(text):
     return pd.DataFrame(records)
 
 
-# -------------------------------------------------
-# Streamlit UI
-# -------------------------------------------------
-st.set_page_config(page_title="PhonePe PDF → CSV / Excel", page_icon="💳")
-st.title("💳 PhonePe PDF → CSV / Excel Converter")
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="PhonePe Analyzer", page_icon="💳")
+st.title("💳 PhonePe Statement Analyzer")
 
 st.markdown("""
-### ℹ️ How to use
-1. Upload your **PhonePe PDF statement**
-2. Enter password **only if prompted**
-3. Click **Convert**
-4. Download **CSV or Excel**
-
-✅ Supports all known PhonePe formats  
-🔐 Files are processed locally and never stored
+### ℹ️ What this app does
+- Converts PhonePe PDF → CSV / Excel
+- Automatically categorizes expenses
+- Shows where your money is going 📊
 """)
 
 uploaded = st.file_uploader("📂 Upload PhonePe PDF", type="pdf")
-password = st.text_input("🔑 PDF Password (only if required)", type="password")
-fmt = st.radio("📄 Output format", ["csv", "excel"])
+fmt = st.radio("📄 Download format", ["csv", "excel"])
 
-if uploaded and st.button("🚀 Convert"):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded.getbuffer())
-            pdf_path = tmp.name
+if uploaded and st.button("🚀 Analyze"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded.getbuffer())
+        path = tmp.name
 
-        pdf_path, text = unlock_pdf_if_needed(pdf_path, password)
+    text = extract_text(path)
+    df = parse_transactions(text)
+    os.remove(path)
 
-        df = parse_transactions(text)
+    if df.empty:
+        st.error("No transactions found.")
+    else:
+        st.success(f"Parsed {len(df)} transactions")
 
-        if df.empty:
-            st.error("❌ No transactions found.")
+        # -----------------------------
+        # Overview
+        # -----------------------------
+        total_debit = df[df["Type"] == "Debit"]["Amount"].sum()
+        total_credit = df[df["Type"] == "Credit"]["Amount"].sum()
+
+        col1, col2 = st.columns(2)
+        col1.metric("Total Spent (Debit)", f"₹{total_debit:,.0f}")
+        col2.metric("Total Received (Credit)", f"₹{total_credit:,.0f}")
+
+        # -----------------------------
+        # Category analysis
+        # -----------------------------
+        st.subheader("📊 Spending by Category")
+        cat_df = (
+            df[df["Type"] == "Debit"]
+            .groupby("Category")["Amount"]
+            .sum()
+            .sort_values(ascending=False)
+            .reset_index()
+        )
+        st.bar_chart(cat_df.set_index("Category"))
+
+        # -----------------------------
+        # Top merchants
+        # -----------------------------
+        st.subheader("🏪 Top Spending Merchants")
+        top_merchants = (
+            df[df["Type"] == "Debit"]
+            .groupby("Transaction Details")["Amount"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+        st.table(top_merchants)
+
+        # -----------------------------
+        # Raw data
+        # -----------------------------
+        st.subheader("📄 All Transactions")
+        st.dataframe(df, use_container_width=True)
+
+        # -----------------------------
+        # Downloads
+        # -----------------------------
+        if fmt == "csv":
+            st.download_button(
+                "⬇️ Download CSV",
+                df.to_csv(index=False).encode("utf-8"),
+                "phonepe_analysis.csv",
+                "text/csv"
+            )
         else:
-            st.success(f"✅ Parsed {len(df)} transactions")
-            st.dataframe(df.head(10), use_container_width=True)
-
-            if fmt == "csv":
+            df_excel = df.applymap(sanitize_for_excel)
+            tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+            df_excel.to_excel(tmp_out.name, index=False)
+            with open(tmp_out.name, "rb") as f:
                 st.download_button(
-                    "⬇️ Download CSV",
-                    df.to_csv(index=False).encode("utf-8"),
-                    "phonepe_transactions.csv",
-                    "text/csv"
+                    "⬇️ Download Excel",
+                    f.read(),
+                    "phonepe_analysis.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-            else:
-                # 🔥 SANITIZE before Excel export
-                df_excel = df.applymap(sanitize_for_excel)
-
-                tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-                df_excel.to_excel(tmp_out.name, index=False)
-                with open(tmp_out.name, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download Excel",
-                        f.read(),
-                        "phonepe_transactions.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                os.remove(tmp_out.name)
-
-        os.remove(pdf_path)
-
-    except Exception as e:
-        st.error(f"❌ Error: {str(e)}")
+            os.remove(tmp_out.name)
