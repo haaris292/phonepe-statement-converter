@@ -9,19 +9,45 @@ import pdfplumber
 from PyPDF2 import PdfReader, PdfWriter
 import re
 import os
+import unicodedata
 
 # -------------------------------------------------
 # Regex patterns (universal PhonePe support)
 # -------------------------------------------------
 DATE_RE = re.compile(r'[A-Za-z]{3}\s+\d{1,2},\s*\d{4}')
 TIME_RE = re.compile(r'\d{1,2}[:￾]\d{2}\s*(am|pm)', re.IGNORECASE)
-AMOUNT_RE = re.compile(r'(DEBIT|CREDIT)\s*[₹₹]?\s*([\d,]+)', re.IGNORECASE)
+AMOUNT_RE = re.compile(r'(DEBIT|CREDIT)\s*[₹]?\s*([\d,]+)', re.IGNORECASE)
 TID_RE = re.compile(r'Transaction ID\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
 UTR_RE = re.compile(r'UTR\s*No\.?\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
 DETAILS_RE = re.compile(
     r'(Paid to|Received from)\s+(.+?)\s+(DEBIT|CREDIT)',
     re.IGNORECASE | re.DOTALL
 )
+
+# -------------------------------------------------
+# Text sanitization for Excel
+# -------------------------------------------------
+def sanitize_for_excel(value):
+    """
+    Remove characters that Excel does not allow.
+    """
+    if not isinstance(value, str):
+        return value
+
+    # Normalize unicode
+    value = unicodedata.normalize("NFKD", value)
+
+    # Remove control characters (ASCII <32 except \n, \t)
+    value = "".join(
+        ch for ch in value
+        if ch == "\n" or ch == "\t" or ord(ch) >= 32
+    )
+
+    # Explicitly remove problematic PDF artifacts
+    value = value.replace("￾", "").replace("\uFFFE", "").replace("\uFFFF", "")
+
+    return value.strip()
+
 
 # -------------------------------------------------
 # PDF helpers
@@ -33,7 +59,6 @@ def try_extract_text(pdf_path):
             for page in pdf.pages:
                 t = page.extract_text(x_tolerance=2, y_tolerance=2)
                 if t:
-                    # normalize weird control characters
                     t = t.replace("￾", ":")
                     text += "\n" + t
         return text if text.strip() else None
@@ -42,7 +67,6 @@ def try_extract_text(pdf_path):
 
 
 def unlock_pdf_if_needed(pdf_path, password):
-    # First try reading directly
     text = try_extract_text(pdf_path)
     if text:
         return pdf_path, text
@@ -77,8 +101,6 @@ def unlock_pdf_if_needed(pdf_path, password):
 # -------------------------------------------------
 def parse_transactions(text):
     records = []
-
-    # Split by UTR (strongest anchor)
     chunks = re.split(r'UTR\s*No\.?\s*(?:\:)?\s*', text, flags=re.IGNORECASE)
 
     for chunk in chunks[1:]:
@@ -126,9 +148,9 @@ st.markdown("""
 1. Upload your **PhonePe PDF statement**
 2. Enter password **only if prompted**
 3. Click **Convert**
-4. Download **CSV / Excel**
+4. Download **CSV or Excel**
 
-✅ Supports **all known PhonePe PDF formats**  
+✅ Supports all known PhonePe formats  
 🔐 Files are processed locally and never stored
 """)
 
@@ -160,8 +182,11 @@ if uploaded and st.button("🚀 Convert"):
                     "text/csv"
                 )
             else:
+                # 🔥 SANITIZE before Excel export
+                df_excel = df.applymap(sanitize_for_excel)
+
                 tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-                df.to_excel(tmp_out.name, index=False)
+                df_excel.to_excel(tmp_out.name, index=False)
                 with open(tmp_out.name, "rb") as f:
                     st.download_button(
                         "⬇️ Download Excel",
