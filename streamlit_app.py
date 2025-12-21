@@ -11,96 +11,95 @@ import re
 import os
 
 # -------------------------------------------------
-# Regex patterns (robust)
+# Regex patterns (universal PhonePe support)
 # -------------------------------------------------
 DATE_RE = re.compile(r'[A-Za-z]{3}\s+\d{1,2},\s*\d{4}')
-TIME_RE = re.compile(r'\d{1,2}:\d{2}\s*(AM|PM)', re.IGNORECASE)
-AMOUNT_RE = re.compile(r'(Debit|Credit)\s+INR\s+([\d,]+\.\d{2})', re.IGNORECASE)
-TID_RE = re.compile(r'Transaction ID\s*:\s*(\S+)', re.IGNORECASE)
-UTR_SPLIT_RE = re.compile(r'UTR No\s*:\s*', re.IGNORECASE)
+TIME_RE = re.compile(r'\d{1,2}[:￾]\d{2}\s*(am|pm)', re.IGNORECASE)
+AMOUNT_RE = re.compile(r'(DEBIT|CREDIT)\s*[₹₹]?\s*([\d,]+)', re.IGNORECASE)
+TID_RE = re.compile(r'Transaction ID\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
+UTR_RE = re.compile(r'UTR\s*No\.?\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
 DETAILS_RE = re.compile(
-    r'(Paid to|Received from)\s+(.+?)(Debit|Credit)',
+    r'(Paid to|Received from)\s+(.+?)\s+(DEBIT|CREDIT)',
     re.IGNORECASE | re.DOTALL
 )
 
 # -------------------------------------------------
 # PDF helpers
 # -------------------------------------------------
-def try_extract_text(pdf_path: str) -> str | None:
-    """
-    Attempt to extract text without worrying about encryption.
-    Returns text if successful, else None.
-    """
+def try_extract_text(pdf_path):
     try:
         text = ""
-        with pdfplumber.open(pdf_path, laparams={"detect_vertical": False}) as pdf:
+        with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 t = page.extract_text(x_tolerance=2, y_tolerance=2)
                 if t:
+                    # normalize weird control characters
+                    t = t.replace("￾", ":")
                     text += "\n" + t
         return text if text.strip() else None
     except Exception:
         return None
 
 
-def unlock_pdf_if_needed(pdf_path: str, password: str | None) -> str:
-    """
-    Unlock PDF ONLY if text extraction fails.
-    """
-    # First attempt: extract directly
-    direct_text = try_extract_text(pdf_path)
-    if direct_text:
-        return pdf_path
+def unlock_pdf_if_needed(pdf_path, password):
+    # First try reading directly
+    text = try_extract_text(pdf_path)
+    if text:
+        return pdf_path, text
 
-    # If extraction failed, try decrypting
     reader = PdfReader(pdf_path)
-
     if not reader.is_encrypted:
-        raise ValueError("PDF could not be read, but is not encrypted.")
+        raise ValueError("PDF text could not be read.")
 
     if not password:
-        raise ValueError("PDF appears restricted. Please provide the password.")
+        raise ValueError("PDF appears restricted. Please provide password.")
 
     if reader.decrypt(password) == 0:
         raise ValueError("Incorrect PDF password.")
 
     writer = PdfWriter()
-    for page in reader.pages:
-        writer.add_page(page)
+    for p in reader.pages:
+        writer.add_page(p)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     with open(tmp.name, "wb") as f:
         writer.write(f)
 
-    return tmp.name
+    text = try_extract_text(tmp.name)
+    if not text:
+        raise ValueError("Unable to extract text even after decryption.")
+
+    return tmp.name, text
 
 
 # -------------------------------------------------
-# Parser (bulletproof)
+# Universal transaction parser
 # -------------------------------------------------
-def parse_transactions_from_text(text: str) -> pd.DataFrame:
+def parse_transactions(text):
     records = []
-    chunks = UTR_SPLIT_RE.split(text)
+
+    # Split by UTR (strongest anchor)
+    chunks = re.split(r'UTR\s*No\.?\s*(?:\:)?\s*', text, flags=re.IGNORECASE)
 
     for chunk in chunks[1:]:
         try:
             utr = re.match(r'(\S+)', chunk).group(1)
 
-            tid_match = TID_RE.search(chunk)
-            tid = tid_match.group(1) if tid_match else ""
+            tid = TID_RE.search(chunk)
+            tid = tid.group(1) if tid else ""
 
-            amt_match = AMOUNT_RE.search(chunk)
-            txn_type = amt_match.group(1).title() if amt_match else ""
-            amount = amt_match.group(2).replace(",", "") if amt_match else ""
+            amt = AMOUNT_RE.search(chunk)
+            txn_type = amt.group(1).title() if amt else ""
+            amount = amt.group(2).replace(",", "") if amt else ""
 
-            date_match = DATE_RE.search(chunk)
-            date = date_match.group(0) if date_match else ""
+            date = DATE_RE.search(chunk)
+            date = date.group(0) if date else ""
 
-            time_match = TIME_RE.search(chunk)
-            time = time_match.group(0) if time_match else ""
+            time = TIME_RE.search(chunk)
+            time = time.group(0) if time else ""
 
-            details_match = DETAILS_RE.search(chunk)
-            details = details_match.group(2).strip() if details_match else ""
+            details = DETAILS_RE.search(chunk)
+            details = details.group(2).strip() if details else ""
 
             records.append({
                 "Date & Time": f"{date} {time}".strip(),
@@ -110,7 +109,6 @@ def parse_transactions_from_text(text: str) -> pd.DataFrame:
                 "Type": txn_type,
                 "Amount": amount
             })
-
         except Exception:
             continue
 
@@ -121,7 +119,6 @@ def parse_transactions_from_text(text: str) -> pd.DataFrame:
 # Streamlit UI
 # -------------------------------------------------
 st.set_page_config(page_title="PhonePe PDF → CSV / Excel", page_icon="💳")
-
 st.title("💳 PhonePe PDF → CSV / Excel Converter")
 
 st.markdown("""
@@ -131,11 +128,12 @@ st.markdown("""
 3. Click **Convert**
 4. Download **CSV / Excel**
 
-🔐 Your data is processed in memory and never stored.
+✅ Supports **all known PhonePe PDF formats**  
+🔐 Files are processed locally and never stored
 """)
 
 uploaded = st.file_uploader("📂 Upload PhonePe PDF", type="pdf")
-password = st.text_input("🔑 PDF Password (only if needed)", type="password")
+password = st.text_input("🔑 PDF Password (only if required)", type="password")
 fmt = st.radio("📄 Output format", ["csv", "excel"])
 
 if uploaded and st.button("🚀 Convert"):
@@ -144,17 +142,12 @@ if uploaded and st.button("🚀 Convert"):
             tmp.write(uploaded.getbuffer())
             pdf_path = tmp.name
 
-        # Unlock only if required
-        pdf_path = unlock_pdf_if_needed(pdf_path, password if password else None)
+        pdf_path, text = unlock_pdf_if_needed(pdf_path, password)
 
-        text = try_extract_text(pdf_path)
-        if not text:
-            raise ValueError("Unable to extract text from PDF.")
-
-        df = parse_transactions_from_text(text)
+        df = parse_transactions(text)
 
         if df.empty:
-            st.error("❌ No transactions found. This PDF format is not supported.")
+            st.error("❌ No transactions found.")
         else:
             st.success(f"✅ Parsed {len(df)} transactions")
             st.dataframe(df.head(10), use_container_width=True)
