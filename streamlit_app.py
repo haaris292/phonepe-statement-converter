@@ -1,5 +1,10 @@
 # streamlit_app.py
-# pip install streamlit pdfplumber pandas openpyxl PyPDF2
+# Requirements:
+# streamlit
+# pdfplumber
+# pandas
+# openpyxl
+# PyPDF2
 
 import streamlit as st
 import pandas as pd
@@ -11,65 +16,64 @@ import os
 import unicodedata
 
 # -----------------------------
-# Regex patterns
+# Regex Patterns (Universal)
 # -----------------------------
 DATE_RE = re.compile(r'[A-Za-z]{3}\s+\d{1,2},\s*\d{4}')
 TIME_RE = re.compile(r'\d{1,2}[:￾]\d{2}\s*(am|pm)', re.IGNORECASE)
 AMOUNT_RE = re.compile(r'(DEBIT|CREDIT)\s*[₹]?\s*([\d,]+)', re.IGNORECASE)
-TID_RE = re.compile(r'Transaction ID\s*(?:\:)?\s*(\S+)', re.IGNORECASE)
 DETAILS_RE = re.compile(
     r'(Paid to|Received from)\s+(.+?)\s+(DEBIT|CREDIT)',
     re.IGNORECASE | re.DOTALL
 )
 
 # -----------------------------
-# Category rules
+# Sanitization
 # -----------------------------
-CATEGORY_RULES = {
-    "Groceries": ["dudh", "milk", "kirana", "store", "mart", "general"],
-    "Medical": ["medical", "pharma", "hospital", "clinic", "eye", "lab"],
-    "Food & Dining": ["hotel", "restaurant", "dosa", "biryani", "bakery"],
-    "Fuel": ["petroleum", "fuel", "hp", "io", "bp"],
-    "Shopping": ["collection", "fashion", "dress"],
-    "Utilities": ["electric", "water", "gas"],
-}
+def sanitize_text(text):
+    if not isinstance(text, str):
+        return text
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if ord(ch) >= 32)
+    return text.strip()
+
 
 # -----------------------------
-# Helpers
+# Safe PDF Extraction
 # -----------------------------
-def sanitize_for_excel(val):
-    if not isinstance(val, str):
-        return val
-    val = unicodedata.normalize("NFKD", val)
-    val = "".join(ch for ch in val if ord(ch) >= 32)
-    return val.strip()
+def safe_extract_text(pdf_path):
+    """
+    Safely extract text from PDF.
+    Prevents pdfminer crashes from breaking app.
+    """
+    try:
+        text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                try:
+                    page_text = page.extract_text(x_tolerance=2, y_tolerance=2)
+                    if page_text:
+                        page_text = page_text.replace("￾", ":")
+                        text += "\n" + page_text
+                except Exception:
+                    continue
+        return text
+    except Exception:
+        return None
 
 
-def categorize(details):
-    text = details.lower()
-    for cat, keywords in CATEGORY_RULES.items():
-        if any(k in text for k in keywords):
-            return cat
-    return "Others"
-
-
-def extract_text(pdf_path):
-    text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text(x_tolerance=2, y_tolerance=2)
-            if t:
-                text += "\n" + t.replace("￾", ":")
-    return text
-
-
+# -----------------------------
+# Transaction Parser
+# -----------------------------
 def parse_transactions(text):
     records = []
+
+    # Split by UTR (strong anchor)
     chunks = re.split(r'UTR\s*No\.?\s*(?:\:)?\s*', text, flags=re.IGNORECASE)
 
     for chunk in chunks[1:]:
         try:
-            utr = re.match(r'(\S+)', chunk).group(1)
+            utr_match = re.match(r'(\S+)', chunk)
+            utr = utr_match.group(1) if utr_match else ""
 
             amt = AMOUNT_RE.search(chunk)
             txn_type = amt.group(1).title() if amt else ""
@@ -89,105 +93,114 @@ def parse_transactions(text):
                 "Transaction Details": details,
                 "Type": txn_type,
                 "Amount": amount,
-                "Category": categorize(details)
+                "UTR": utr
             })
         except Exception:
             continue
 
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["Transaction Details"] = df["Transaction Details"].apply(sanitize_text)
+    return df
 
 
 # -----------------------------
-# UI
+# Category Logic
+# -----------------------------
+CATEGORY_RULES = {
+    "Groceries": ["dudh", "milk", "kirana", "mart", "store", "general"],
+    "Medical": ["medical", "pharma", "hospital", "clinic", "lab", "eye"],
+    "Food & Dining": ["hotel", "restaurant", "dosa", "bakery"],
+    "Fuel": ["petroleum", "fuel"],
+    "Shopping": ["collection", "fashion"],
+}
+
+def categorize(text):
+    text = text.lower()
+    for cat, words in CATEGORY_RULES.items():
+        if any(w in text for w in words):
+            return cat
+    return "Others"
+
+
+# -----------------------------
+# Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="PhonePe Analyzer", page_icon="💳")
-st.title("💳 PhonePe Statement Analyzer")
+st.title("💳 PhonePe PDF Analyzer")
 
 st.markdown("""
-### ℹ️ What this app does
+### What this app does
 - Converts PhonePe PDF → CSV / Excel
-- Automatically categorizes expenses
-- Shows where your money is going 📊
+- Categorizes your spending
+- Shows spending insights
 """)
 
-uploaded = st.file_uploader("📂 Upload PhonePe PDF", type="pdf")
-fmt = st.radio("📄 Download format", ["csv", "excel"])
+uploaded = st.file_uploader("Upload PhonePe PDF", type="pdf")
+download_format = st.radio("Download format", ["csv", "excel"])
 
-if uploaded and st.button("🚀 Analyze"):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded.getbuffer())
-        path = tmp.name
+if uploaded and st.button("Analyze"):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded.getbuffer())
+            path = tmp.name
 
-    text = extract_text(path)
-    df = parse_transactions(text)
-    os.remove(path)
+        text = safe_extract_text(path)
+        os.remove(path)
 
-    if df.empty:
-        st.error("No transactions found.")
-    else:
+        if not text:
+            st.error("Could not extract text from this PDF.")
+            st.stop()
+
+        df = parse_transactions(text)
+
+        if df.empty:
+            st.error("No transactions found in this PDF.")
+            st.stop()
+
+        df["Category"] = df["Transaction Details"].apply(categorize)
+
         st.success(f"Parsed {len(df)} transactions")
 
-        # -----------------------------
-        # Overview
-        # -----------------------------
-        total_debit = df[df["Type"] == "Debit"]["Amount"].sum()
-        total_credit = df[df["Type"] == "Credit"]["Amount"].sum()
+        # Metrics
+        total_spent = df[df["Type"] == "Debit"]["Amount"].sum()
+        total_received = df[df["Type"] == "Credit"]["Amount"].sum()
 
         col1, col2 = st.columns(2)
-        col1.metric("Total Spent (Debit)", f"₹{total_debit:,.0f}")
-        col2.metric("Total Received (Credit)", f"₹{total_credit:,.0f}")
+        col1.metric("Total Spent", f"₹{total_spent:,.0f}")
+        col2.metric("Total Received", f"₹{total_received:,.0f}")
 
-        # -----------------------------
-        # Category analysis
-        # -----------------------------
-        st.subheader("📊 Spending by Category")
+        # Category Chart
+        st.subheader("Spending by Category")
         cat_df = (
             df[df["Type"] == "Debit"]
             .groupby("Category")["Amount"]
             .sum()
             .sort_values(ascending=False)
-            .reset_index()
         )
-        st.bar_chart(cat_df.set_index("Category"))
+        st.bar_chart(cat_df)
 
-        # -----------------------------
-        # Top merchants
-        # -----------------------------
-        st.subheader("🏪 Top Spending Merchants")
-        top_merchants = (
-            df[df["Type"] == "Debit"]
-            .groupby("Transaction Details")["Amount"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-        st.table(top_merchants)
-
-        # -----------------------------
-        # Raw data
-        # -----------------------------
-        st.subheader("📄 All Transactions")
+        # Raw Table
+        st.subheader("All Transactions")
         st.dataframe(df, use_container_width=True)
 
-        # -----------------------------
         # Downloads
-        # -----------------------------
-        if fmt == "csv":
+        if download_format == "csv":
             st.download_button(
-                "⬇️ Download CSV",
+                "Download CSV",
                 df.to_csv(index=False).encode("utf-8"),
-                "phonepe_analysis.csv",
-                "text/csv"
+                "phonepe_analysis.csv"
             )
         else:
-            df_excel = df.applymap(sanitize_for_excel)
             tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            df_excel.to_excel(tmp_out.name, index=False)
+            df.to_excel(tmp_out.name, index=False)
             with open(tmp_out.name, "rb") as f:
                 st.download_button(
-                    "⬇️ Download Excel",
+                    "Download Excel",
                     f.read(),
-                    "phonepe_analysis.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    "phonepe_analysis.xlsx"
                 )
             os.remove(tmp_out.name)
+
+    except Exception as e:
+        st.error("Unexpected error occurred.")
